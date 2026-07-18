@@ -92,9 +92,16 @@ def load_model(model_id: str):
 
     print(f"Loading {model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, device_map="auto", dtype=torch.bfloat16
-    )
+    # transformers renamed the precision kwarg torch_dtype -> dtype; older
+    # releases only accept torch_dtype, so try the new name and fall back.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, device_map="auto", dtype=torch.bfloat16
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, device_map="auto", torch_dtype=torch.bfloat16
+        )
     model.eval()
     return model, tokenizer
 
