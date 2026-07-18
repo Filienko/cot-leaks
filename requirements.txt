@@ -1,0 +1,10 @@
+# Core (required for the real attack on GPU)
+torch>=2.1
+transformers>=4.44
+datasets>=2.19
+numpy>=1.24
+
+# Metrics (optional -- each degrades to `None` in the report if missing)
+sacrebleu>=2.4          # BLEU
+rouge-score>=0.1.2      # ROUGE-L
+sentence-transformers>=2.7   # embedding similarity (arXiv:2510.18554)
