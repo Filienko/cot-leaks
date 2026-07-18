@@ -13,24 +13,59 @@ context, beyond background language-modelling noise. We isolate that shift with
 a differential query and use it to reconstruct the hidden reasoning token by
 token.
 
+## Threat model
+
+The attacker knows the user's **question Q** and the model's **public answer A**
+(the output *not* between the `<think>` tags). The attacker does **not** know the
+hidden `<think>` reasoning — that is the extraction target. The attacker can
+query the model's next-token logits (open weights: full vocab; or an API exposing
+logprobs). Default target: `deepseek-ai/DeepSeek-R1-Distill-Llama-8B`.
+
 ## Method
 
-For a reconstructed prefix `c_{<t}`:
+### `answer_anchored` (default — the real inversion)
+
+The public answer **A is the anchor**. We reconstruct the hidden CoT `c` token by
+token to maximise how well the model explains the *known* answer, with an
+**empty-reasoning control** subtracted:
 
 ```
-delta = logits_target(context + c_{<t})  -  logits_base(c_{<t})
+score(c) = log P(A | Q, <think> c </think>)  −  log P(A | Q, <think></think>)
+                    └── candidate reasoning ──┘        └──── empty control ────┘
 ```
 
-- **target** — the instance primed with the hidden context (the victim's
-  question sitting in front of its hidden `<think>` trace).
-- **base** — a zero-context control: the same model and prefix with the priming
-  context removed, giving the pure LM prior.
+The control is the "zero-context" query: the answer's likelihood with **no
+reasoning at all**. Subtracting it isolates what the reasoning *contributes* to
+the answer, so the score rewards tokens that explain A rather than tokens that
+are merely fluent. A token is accepted only if it raises `score` by at least
+`--gain-threshold` **nats**; otherwise the path has gone flat (wrong turn /
+natural end) and the **backtracking beam search** drops it. Candidate tokens are
+proposed by the question-priming delta `logits_target − logits_base` so only
+context-relevant tokens are ever scored. Everything runs over **token ids** to
+avoid BPE round-trip corruption (`decode`→`encode` is not identity).
 
-`delta ~ 0` ⇒ ordinary LM continuation → **pruned**. `delta` above a threshold
-⇒ **context-primed** → beam candidate. An autoregressive **backtracking beam
-search** appends the highest-delta token, advances, and backtracks when a path
-goes flat (no spike = wrong turn). The search runs entirely over **token ids**
-to avoid BPE round-trip corruption (`decode`→`encode` is not identity).
+This uses exactly what the attacker holds (Q and A) and never reads the `<think>`
+tokens. It genuinely *inverts*: given Q and A, recover the reasoning that bridges
+them.
+
+### `continuation` (cheap variant, `--method continuation`)
+
+`delta = logits_target(Q + <think> + c) − logits_base(<think> + c)` isolates the
+question's priming of the next reasoning token; a token is kept if
+`delta > --delta-threshold` logits. Fast (2 forwards/step) but, since the
+attacker already holds Q, this *regenerates* the trace rather than inverting
+against A — it's the proposal signal, exposed on its own for comparison.
+
+### Why not just match logits at one answer position (the original PoC)
+
+The first-cut PoC scored candidates by the L2 distance between logits at a single
+position right after a fixed answer prefix. That position's next token is
+dominated by the answer prefix, not the reasoning, so the signal is degenerate —
+every candidate looks alike. Combined with a cumulative loss that only ever grows
+per step (while a finished `</think>` path freezes), the search collapses to
+emitting `</think>` immediately or locking in noise. The answer-anchored score
+fixes both: it scores the likelihood of the **whole** answer (sensitive to `c`)
+with a **standalone** per-token gain (no length bias).
 
 ## Files
 
@@ -63,30 +98,32 @@ Optional metric deps (`sacrebleu`, `rouge_score`, `sentence-transformers`)
 degrade to `n/a` in the report if not installed; the exact/edit/F1 metrics
 always run.
 
-## Threat model
-
-The attacker observes the victim's question and public answer, and can query the
-target model's next-token logits (open-weights: full vocab; or an API exposing
-logprobs / token biases). They also control a base instance of the same model
-with no hidden context. The default target is
-`deepseek-ai/DeepSeek-R1-Distill-Llama-8B` (open weights, full logit access).
-
 ## Running
 
 ```bash
 pip install -r requirements.txt          # needs a GPU for the default 8B model
 
+# Default: answer-anchored inversion against the public answer A.
 python reconstruction_poc.py \
     --model-id deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
-    --beam-width 4 --top-k 8 --delta-threshold 1.0 --max-tokens 64
+    --beam-width 4 --top-k 8 --gain-threshold 0.05 --max-tokens 64
 
-python reconstruction_poc.py --use-gsm8k   # first GSM8K test question
+python reconstruction_poc.py --method continuation --delta-threshold 1.0
+python reconstruction_poc.py --use-gsm8k     # first GSM8K test question
 python reconstruction_poc.py --no-embedding  # skip the embedding metric
 ```
 
-`--delta-threshold` is the key knob: raise it to demand stronger priming
-evidence per token (higher precision, more backtracking); lower it to extract
-more aggressively.
+Key knobs:
+
+- `--gain-threshold` (answer-anchored): minimum gain in `log P(A)` (nats) to
+  accept a token. Model/dataset dependent — raise for precision + more
+  backtracking, lower to extract more aggressively. Start at `0.05` and tune.
+- `--delta-threshold` (continuation): minimum priming logit delta to accept a
+  token.
+
+The report prints **full, untruncated** outputs for every method (ground-truth
+CoT, public answer, both baselines, and the reconstruction) plus the metrics
+table and query cost.
 
 ### Self-tests (no GPU)
 

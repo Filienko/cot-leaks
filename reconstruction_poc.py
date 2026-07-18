@@ -41,10 +41,17 @@ def parse_args():
     p.add_argument("--question", default=None, help="Override the math question.")
     p.add_argument("--use-gsm8k", action="store_true",
                    help="Pull the first GSM8K test question instead of the default.")
+    p.add_argument("--method", choices=["answer_anchored", "continuation"],
+                   default="answer_anchored",
+                   help="answer_anchored: invert against the public answer A (default). "
+                        "continuation: cheap question-priming regeneration.")
     p.add_argument("--beam-width", type=int, default=4)
     p.add_argument("--top-k", type=int, default=8)
     p.add_argument("--delta-threshold", type=float, default=1.0,
-                   help="Min target-base logit delta to treat a token as context-primed.")
+                   help="continuation only: min target-base logit delta to accept a token.")
+    p.add_argument("--gain-threshold", type=float, default=0.05,
+                   help="answer_anchored only: min gain (nats) in log P(A) to accept a token. "
+                        "Model/dataset dependent -- raise for precision, lower to extract more.")
     p.add_argument("--max-tokens", type=int, default=64,
                    help="Max CoT tokens to reconstruct via the side channel.")
     p.add_argument("--gt-max-new-tokens", type=int, default=400,
@@ -157,14 +164,16 @@ def main():
     jb_pred = extract_reasoning_copy(jb_raw)
 
     # --- Differential side channel --------------------------------------- #
-    print("\n[Side channel] Differential (target - base) beam search ...")
+    print(f"\n[Side channel] Differential attack (method={args.method}) ...")
     sc_counter = metrics.QueryCounter()
-    oracle = build_cot_oracle(model, tokenizer, question, counter=sc_counter)
+    oracle = build_cot_oracle(model, tokenizer, question, answer_text, counter=sc_counter)
     extractor = DifferentialExtractor(
         oracle,
+        method=args.method,
         beam_width=args.beam_width,
         top_k=args.top_k,
         delta_threshold=args.delta_threshold,
+        gain_threshold=args.gain_threshold,
         max_tokens=args.max_tokens,
     )
     result = extractor.run(decode=lambda ids: tokenizer.decode(ids, skip_special_tokens=True))
@@ -182,16 +191,32 @@ def main():
     print("HIDDEN-CoT EXTRACTION REPORT")
     print("=" * 96)
     print(f"\n[Question]\n{question}")
-    print(f"\n[Ground-truth hidden CoT] ({len(cot_ids)} tokens)\n{cot_text}")
-    print(f"\n[Public answer]\n{answer_text}")
+    print(f"\n[Ground-truth hidden CoT]  ({len(cot_ids)} tokens)\n{cot_text}")
+    print(f"\n[Public answer A -- the extraction anchor, known to the attacker]\n{answer_text}")
 
+    # Full, untruncated raw outputs for each method.
     print("\n" + "-" * 96)
-    print(f"{'method':<22}{'queries':>9}  metrics")
+    print("[Baseline: naive direct prompt] -- full raw output")
+    print("-" * 96)
+    print(naive_raw)
+    print("\n" + "-" * 96)
+    print("[Baseline: jailbreak prompt] -- full raw output")
+    print("-" * 96)
+    print(jb_raw)
+    print("\n" + "-" * 96)
+    print(f"[Side channel: {args.method}] -- full reconstructed hidden CoT "
+          f"({len(result.token_ids)} tokens)")
+    print("-" * 96)
+    print(result.text)
+
+    # Metrics table (vs. the true hidden CoT).
+    print("\n" + "-" * 96)
+    print(f"{'method':<22}{'queries':>9}  metrics (vs. true hidden CoT)")
     print("-" * 96)
     for name, scores, q in (
         ("naive prompt", naive_scores, naive_counter.forward_passes),
         ("jailbreak prompt", jb_scores, jb_counter.forward_passes),
-        ("differential channel", sc_scores, result.forward_passes),
+        (f"side channel", sc_scores, result.forward_passes),
     ):
         print(f"{name:<22}{q:>9}  {scores.as_row()}")
 
@@ -201,11 +226,14 @@ def main():
         f"({result.forward_passes} passes / {len(result.token_ids)} tokens, "
         f"{result.steps} steps)"
     )
-    if result.per_position_max_delta:
-        avg_delta = sum(result.per_position_max_delta) / len(result.per_position_max_delta)
-        print(f"mean per-position max delta (priming signal strength): {avg_delta:.3f}")
-
-    print(f"\n[Reconstructed CoT (side channel, {len(result.token_ids)} tokens)]\n{result.text}")
+    if result.method == "answer_anchored":
+        print(f"final delta log P(A) (answer explained by reconstructed CoT): {result.score:.3f} nats")
+    if result.per_position_signal:
+        avg = sum(result.per_position_signal) / len(result.per_position_signal)
+        label = ("mean per-token answer-likelihood gain (nats)"
+                 if result.method == "answer_anchored"
+                 else "mean per-position max priming delta (logits)")
+        print(f"{label}: {avg:.3f}")
     print("=" * 96)
 
 
