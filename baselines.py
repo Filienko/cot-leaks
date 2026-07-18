@@ -69,6 +69,43 @@ def run_jailbreak_baseline(model, tokenizer, question: str, max_new_tokens: int 
                      max_new_tokens, counter)
 
 
+def run_greedy_regeneration(model, tokenizer, question: str,
+                            max_new_tokens: int = 400, counter=None) -> str:
+    """Attacker's best guess *without* the side channel: re-run Q greedily and
+    take the reasoning the model produces.
+
+    This is the key comparison for the priming-delta method: when the victim's
+    CoT was *sampled*, greedy regeneration yields a different trace, so beating
+    this baseline shows the logit channel recovers the victim's *specific* hidden
+    reasoning rather than just a plausible one. Returns only the <think> span.
+    """
+    import torch
+
+    messages = [
+        {"role": "system", "content": "You are a helpful math assistant. Solve the following problem."},
+        {"role": "user", "content": question},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        gen = model.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    if counter is not None:
+        counter.tick(int(gen.shape[1] - inputs.input_ids.shape[1]))
+    gen_ids = gen[0][inputs.input_ids.shape[1]:].tolist()
+
+    close_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    close_id = close_ids[-1] if close_ids else None
+    open_ids = set(tokenizer.encode("<think>", add_special_tokens=False))
+    if close_id is not None and close_id in gen_ids:
+        cot_ids = [t for t in gen_ids[:gen_ids.index(close_id)] if t not in open_ids]
+    else:
+        cot_ids = [t for t in gen_ids if t not in open_ids]
+    return tokenizer.decode(cot_ids, skip_special_tokens=True).strip()
+
+
 def extract_reasoning_copy(baseline_text: str) -> str:
     """Best-effort pull of the 'verbatim copy' section a text baseline produces.
 

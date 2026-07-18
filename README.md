@@ -48,6 +48,38 @@ This uses exactly what the attacker holds (Q and A) and never reads the `<think>
 tokens. It genuinely *inverts*: given Q and A, recover the reasoning that bridges
 them.
 
+### `priming` (`--method priming`) — the brief-faithful pure side channel
+
+This is the differential the project brief describes literally, and it needs
+**no answer A**. A *target* instance **holds the hidden CoT in its context**; a
+*zero-context control* instance does not. For candidate prefix `c`:
+
+```
+target = model( Q <think> C </think> [A] + "repeat your reasoning…<think>" + c )
+base   = model( Q                        + "repeat your reasoning…<think>" + c )
+delta  = logits(target) − logits(base)    →  the true next token of C spikes
+```
+
+The in-context `C` primes its own tokens (verbatim-copy / induction behaviour),
+so the true next token shows an anomalous positive delta while LM artifacts
+cancel. Walk `c` forward, accepting tokens with `delta > --delta-threshold`,
+backtracking when the spike vanishes. The control is **base = the query Q** (not
+empty): because the attacker knows Q, Q cancels in the delta and only the unknown
+`C` is isolated. The extractor **only reads logits** — it never reads `C`; the
+elicitation string merely puts the target into a re-emit state.
+
+Realism caveat: this assumes you can query a target instance that *still holds*
+the hidden CoT and read its logits. Deployed reasoning APIs typically discard the
+hidden CoT before the next turn and never expose such logits, so `priming` is
+honestly an **open-weights PoC** — the harness stands up the victim session, but
+the attack path only appends the elicitation + its reconstruction and reads
+logits. For it to demonstrate anything beyond regeneration, the victim CoT must
+be **sampled** (`--sample-cot`, temp>0, seed the attacker lacks) or shaped by a
+hidden system prompt; otherwise "target holds C" collapses into "just re-run Q".
+The `greedy regeneration` baseline in the report is the yardstick: `priming`
+should recover the victim's *specific* sampled trace with higher verbatim /
+embedding similarity than blind regeneration.
+
 ### `continuation` (cheap variant, `--method continuation`)
 
 `delta = logits_target(Q + <think> + c) − logits_base(<think> + c)` isolates the
@@ -73,7 +105,7 @@ with a **standalone** per-token gain (no length bias).
 |------|------|
 | `reconstruction_poc.py` | entrypoint: ground-truth capture, baselines, attack, report |
 | `attack.py` | differential `target − base` beam search; `LogitOracle` / `HFOracle` |
-| `baselines.py` | text-layer baselines: naive direct prompt + jailbreak |
+| `baselines.py` | baselines: naive prompt, jailbreak, greedy regeneration |
 | `metrics.py` | fidelity metrics + query accounting |
 | `tests/test_mock.py` | torch-free self-tests (numpy mock oracle) |
 
@@ -108,6 +140,10 @@ python reconstruction_poc.py \
     --model-id deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
     --beam-width 4 --top-k 8 --gain-threshold 0.05 --max-tokens 64
 
+# Brief-faithful pure side channel against a *sampled* victim CoT (no A needed).
+python reconstruction_poc.py --method priming --sample-cot --temperature 0.7 \
+    --delta-threshold 1.0 --max-tokens 64
+
 python reconstruction_poc.py --method continuation --delta-threshold 1.0
 # Question source: defaults to GSM8K "socratic" (test split, row 0).
 python reconstruction_poc.py --gsm8k-index 3           # a different socratic row
@@ -122,11 +158,13 @@ Key knobs:
 - `--gain-threshold` (answer-anchored): minimum gain in `log P(A)` (nats) to
   accept a token. Model/dataset dependent — raise for precision + more
   backtracking, lower to extract more aggressively. Start at `0.05` and tune.
-- `--delta-threshold` (continuation): minimum priming logit delta to accept a
-  token.
+- `--delta-threshold` (continuation / priming): minimum priming logit delta to
+  accept a token.
+- `--sample-cot` / `--temperature` / `--victim-seed`: make the victim's hidden
+  CoT non-trivially regenerable (the meaningful setup for `priming`).
 
 The report prints **full, untruncated** outputs for every method (ground-truth
-CoT, public answer, both baselines, and the reconstruction) plus the metrics
+CoT, public answer, all three baselines, and the reconstruction) plus the metrics
 table and query cost.
 
 ### Self-tests (no GPU)
@@ -135,6 +173,6 @@ table and query cost.
 python tests/test_mock.py
 ```
 
-Verifies the beam mechanics (exact recovery of a planted hidden sequence,
-backtracking on a flat signal) and the metric battery with a numpy mock oracle —
-no model download required.
+Verifies the beam mechanics for all three methods (exact recovery of a planted
+hidden sequence, backtracking on a flat signal) and the metric battery with a
+numpy mock oracle — no model download required.
