@@ -38,9 +38,15 @@ DEFAULT_QUESTION = (
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model-id", default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
-    p.add_argument("--question", default=None, help="Override the math question.")
-    p.add_argument("--use-gsm8k", action="store_true",
-                   help="Pull the first GSM8K test question instead of the default.")
+    p.add_argument("--question", default=None,
+                   help="Override the math question. Takes precedence over the GSM8K loader.")
+    p.add_argument("--gsm8k-config", default="socratic",
+                   help="GSM8K subset to draw the question from (e.g. 'socratic' or 'main'). "
+                        "Set to '' to skip GSM8K and use the built-in DEFAULT_QUESTION.")
+    p.add_argument("--gsm8k-split", default="test",
+                   help="GSM8K split to draw the question from.")
+    p.add_argument("--gsm8k-index", type=int, default=0,
+                   help="Row index of the GSM8K question to use.")
     p.add_argument("--method", choices=["answer_anchored", "continuation"],
                    default="answer_anchored",
                    help="answer_anchored: invert against the public answer A (default). "
@@ -79,13 +85,16 @@ def load_model(model_id: str):
 def get_question(args) -> str:
     if args.question:
         return args.question
-    if args.use_gsm8k:
+    if args.gsm8k_config:
         try:
             from datasets import load_dataset
 
-            return load_dataset("openai/gsm8k", "main", split="test")[0]["question"]
-        except Exception:
-            print("GSM8K load failed; using the built-in question.")
+            ds = load_dataset("openai/gsm8k", args.gsm8k_config, split=args.gsm8k_split)
+            question = ds[args.gsm8k_index]["question"]
+            print(f"Using GSM8K/{args.gsm8k_config}[{args.gsm8k_split}][{args.gsm8k_index}].")
+            return question
+        except Exception as e:
+            print(f"GSM8K load failed ({e}); using the built-in question.")
     return DEFAULT_QUESTION
 
 

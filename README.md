@@ -109,7 +109,11 @@ python reconstruction_poc.py \
     --beam-width 4 --top-k 8 --gain-threshold 0.05 --max-tokens 64
 
 python reconstruction_poc.py --method continuation --delta-threshold 1.0
-python reconstruction_poc.py --use-gsm8k     # first GSM8K test question
+# Question source: defaults to GSM8K "socratic" (test split, row 0).
+python reconstruction_poc.py --gsm8k-index 3           # a different socratic row
+python reconstruction_poc.py --gsm8k-config main       # the plain GSM8K subset
+python reconstruction_poc.py --gsm8k-config ""         # built-in DEFAULT_QUESTION
+python reconstruction_poc.py --question "..."          # your own question
 python reconstruction_poc.py --no-embedding  # skip the embedding metric
 ```
 
