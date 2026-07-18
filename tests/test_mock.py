@@ -119,6 +119,22 @@ def test_continuation_recovers_hidden():
           f"({result.forward_passes} passes)")
 
 
+def test_priming_recovers_hidden():
+    # `priming` reuses the same delta search as `continuation`; the MockOracle's
+    # target/base logits stand in for "target holds the CoT" vs "query only".
+    hidden = [9, 4, 21, 6]
+    oracle = MockOracle(hidden, primed_delta=6.0)
+    extractor = DifferentialExtractor(
+        oracle, method="priming", beam_width=4, top_k=6,
+        delta_threshold=1.0, max_tokens=20,
+    )
+    result = extractor.run()
+    assert result.method == "priming"
+    assert result.token_ids == hidden, f"got {result.token_ids}, want {hidden}"
+    print(f"  priming method recovers hidden via target-base delta "
+          f"({result.forward_passes} passes)")
+
+
 def test_metrics_sanity():
     truth = list(range(20))
     assert metrics.exact_match(truth, truth)
@@ -148,6 +164,7 @@ if __name__ == "__main__":
         test_answer_anchored_recovers_hidden,
         test_answer_anchored_stops_on_flat_signal,
         test_continuation_recovers_hidden,
+        test_priming_recovers_hidden,
         test_metrics_sanity,
         test_query_counter,
     ]

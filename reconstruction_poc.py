@@ -8,10 +8,11 @@ Pipeline
 1. Generate ground truth: run the target model on a math question and capture
    its hidden <think> reasoning + public answer (the answer is the only thing a
    real victim would expose).
-2. Text-layer baselines: naive "repeat your reasoning" prompt and a jailbreak
-   prompt (baselines.py).
+2. Baselines: naive "repeat your reasoning" prompt, a jailbreak prompt, and a
+   greedy regeneration (attacker's guess without the channel) (baselines.py).
 3. Side channel: the differential (target - base) beam search over token ids
-   (attack.py).
+   (attack.py) -- answer_anchored (default), continuation, or priming (target
+   holds the hidden CoT, base = query only; the brief-faithful side channel).
 4. Evaluation: score every method against the true hidden CoT with the metric
    battery in metrics.py (Carlini-style exact overlap, edit distance, BLEU,
    ROUGE, and embedding similarity), and report queries-per-token.
@@ -24,8 +25,13 @@ from __future__ import annotations
 import argparse
 
 import metrics
-from attack import DifferentialExtractor, build_cot_oracle
-from baselines import extract_reasoning_copy, run_jailbreak_baseline, run_naive_baseline
+from attack import DifferentialExtractor, build_cot_oracle, build_priming_oracle
+from baselines import (
+    extract_reasoning_copy,
+    run_greedy_regeneration,
+    run_jailbreak_baseline,
+    run_naive_baseline,
+)
 
 
 DEFAULT_QUESTION = (
@@ -41,10 +47,20 @@ def parse_args():
     p.add_argument("--question", default=None, help="Override the math question.")
     p.add_argument("--use-gsm8k", action="store_true",
                    help="Pull the first GSM8K test question instead of the default.")
-    p.add_argument("--method", choices=["answer_anchored", "continuation"],
+    p.add_argument("--method", choices=["answer_anchored", "continuation", "priming"],
                    default="answer_anchored",
                    help="answer_anchored: invert against the public answer A (default). "
-                        "continuation: cheap question-priming regeneration.")
+                        "continuation: cheap question-priming regeneration. "
+                        "priming: brief-faithful side channel -- target holds the hidden "
+                        "CoT, base = query only, reconstruct from target-base delta (no A).")
+    p.add_argument("--sample-cot", action="store_true",
+                   help="Sample the victim's hidden CoT (temp>0) instead of greedy, so it is "
+                        "not trivially regenerable -- the meaningful setup for --method priming.")
+    p.add_argument("--temperature", type=float, default=0.7,
+                   help="Sampling temperature for the victim CoT when --sample-cot is set.")
+    p.add_argument("--victim-seed", type=int, default=None,
+                   help="Seed for the victim's sampled CoT. The attacker does NOT know it; "
+                        "left unset it is random each run.")
     p.add_argument("--beam-width", type=int, default=4)
     p.add_argument("--top-k", type=int, default=8)
     p.add_argument("--delta-threshold", type=float, default=1.0,
@@ -89,7 +105,9 @@ def get_question(args) -> str:
     return DEFAULT_QUESTION
 
 
-def generate_ground_truth(model, tokenizer, question: str, max_new_tokens: int):
+def generate_ground_truth(model, tokenizer, question: str, max_new_tokens: int,
+                          do_sample: bool = False, temperature: float = 0.7,
+                          seed: int = None):
     """Return (cot_text, cot_ids, answer_text) for the target's hidden trace.
 
     We split on the ``</think>`` *token id* rather than the decoded string and
@@ -105,12 +123,17 @@ def generate_ground_truth(model, tokenizer, question: str, max_new_tokens: int):
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-    print("\n[Target] Generating ground-truth reasoning + answer ...")
+    mode = f"sampled (temp={temperature}, seed={seed})" if do_sample else "greedy"
+    print(f"\n[Target] Generating ground-truth reasoning + answer ({mode}) ...")
+    if do_sample and seed is not None:
+        torch.manual_seed(seed)
+    gen_kwargs = dict(max_new_tokens=max_new_tokens, pad_token_id=tokenizer.eos_token_id)
+    if do_sample:
+        gen_kwargs.update(do_sample=True, temperature=temperature)
+    else:
+        gen_kwargs.update(do_sample=False)
     with torch.no_grad():
-        gen = model.generate(
-            **inputs, max_new_tokens=max_new_tokens, do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        gen = model.generate(**inputs, **gen_kwargs)
     gen_ids = gen[0][inputs.input_ids.shape[1]:].tolist()
 
     close_ids = tokenizer.encode("</think>", add_special_tokens=False)
@@ -150,23 +173,34 @@ def main():
 
     question = get_question(args)
     cot_text, cot_ids, answer_text = generate_ground_truth(
-        model, tokenizer, question, args.gt_max_new_tokens
+        model, tokenizer, question, args.gt_max_new_tokens,
+        do_sample=args.sample_cot, temperature=args.temperature, seed=args.victim_seed,
     )
 
     # --- Text-layer baselines -------------------------------------------- #
     naive_counter = metrics.QueryCounter()
     jb_counter = metrics.QueryCounter()
+    regen_counter = metrics.QueryCounter()
     print("\n[Baseline] Naive direct prompt ...")
     naive_raw = run_naive_baseline(model, tokenizer, question, counter=naive_counter)
     print("[Baseline] Jailbreak prompt ...")
     jb_raw = run_jailbreak_baseline(model, tokenizer, question, counter=jb_counter)
+    print("[Baseline] Greedy regeneration (attacker's guess without the channel) ...")
+    regen_pred = run_greedy_regeneration(model, tokenizer, question, counter=regen_counter)
     naive_pred = extract_reasoning_copy(naive_raw)
     jb_pred = extract_reasoning_copy(jb_raw)
 
     # --- Differential side channel --------------------------------------- #
     print(f"\n[Side channel] Differential attack (method={args.method}) ...")
     sc_counter = metrics.QueryCounter()
-    oracle = build_cot_oracle(model, tokenizer, question, answer_text, counter=sc_counter)
+    if args.method == "priming":
+        # Target instance holds the hidden CoT; the extractor never reads it.
+        oracle = build_priming_oracle(
+            model, tokenizer, question, cot_ids, answer_text=answer_text,
+            counter=sc_counter,
+        )
+    else:
+        oracle = build_cot_oracle(model, tokenizer, question, answer_text, counter=sc_counter)
     extractor = DifferentialExtractor(
         oracle,
         method=args.method,
@@ -185,14 +219,18 @@ def main():
 
     naive_scores = score(naive_pred)
     jb_scores = score(jb_pred)
+    regen_scores = score(regen_pred)
     sc_scores = score(result.text)
+
+    victim_mode = (f"sampled (temp={args.temperature}, seed={args.victim_seed})"
+                   if args.sample_cot else "greedy")
 
     print("\n" + "=" * 96)
     print("HIDDEN-CoT EXTRACTION REPORT")
     print("=" * 96)
     print(f"\n[Question]\n{question}")
-    print(f"\n[Ground-truth hidden CoT]  ({len(cot_ids)} tokens)\n{cot_text}")
-    print(f"\n[Public answer A -- the extraction anchor, known to the attacker]\n{answer_text}")
+    print(f"\n[Ground-truth hidden CoT -- victim {victim_mode}]  ({len(cot_ids)} tokens)\n{cot_text}")
+    print(f"\n[Public answer A -- known to the attacker]\n{answer_text}")
 
     # Full, untruncated raw outputs for each method.
     print("\n" + "-" * 96)
@@ -204,6 +242,10 @@ def main():
     print("-" * 96)
     print(jb_raw)
     print("\n" + "-" * 96)
+    print("[Baseline: greedy regeneration] -- full reconstructed CoT (no side channel)")
+    print("-" * 96)
+    print(regen_pred)
+    print("\n" + "-" * 96)
     print(f"[Side channel: {args.method}] -- full reconstructed hidden CoT "
           f"({len(result.token_ids)} tokens)")
     print("-" * 96)
@@ -211,14 +253,15 @@ def main():
 
     # Metrics table (vs. the true hidden CoT).
     print("\n" + "-" * 96)
-    print(f"{'method':<22}{'queries':>9}  metrics (vs. true hidden CoT)")
+    print(f"{'method':<26}{'queries':>9}  metrics (vs. true hidden CoT)")
     print("-" * 96)
     for name, scores, q in (
         ("naive prompt", naive_scores, naive_counter.forward_passes),
         ("jailbreak prompt", jb_scores, jb_counter.forward_passes),
-        (f"side channel", sc_scores, result.forward_passes),
+        ("greedy regeneration", regen_scores, regen_counter.forward_passes),
+        (f"side channel [{args.method}]", sc_scores, result.forward_passes),
     ):
-        print(f"{name:<22}{q:>9}  {scores.as_row()}")
+        print(f"{name:<26}{q:>9}  {scores.as_row()}")
 
     print("-" * 96)
     print(
