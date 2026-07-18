@@ -11,20 +11,24 @@ The attacker can query the model's next-token logits (open weights: full vocab).
 
 Two methods
 -----------
-1. ``answer_anchored`` (default, the real inversion). The public answer A is the
-   anchor. We reconstruct the hidden CoT ``c`` token by token so as to maximise
-   how well the model explains the *known* answer:
+1. ``answer_anchored`` (default). The public answer A is the anchor. The beam is
+   *driven* by the question-priming differential (as in ``continuation``, below),
+   which robustly surfaces the next reasoning token; A is then used to pick where
+   to truncate. Over the primed candidates we score
 
-        score(c) = log P(A | Q, <think> c </think>) - log P(A | Q, <think></think>)
+        delta(c) = log P(A | Q, <think> c </think>) - log P(A | Q, <think></think>)
                             └── candidate reasoning ──┘        └── empty control ──┘
 
    The second term is the **zero-context / empty-reasoning** control: the answer's
    likelihood with no reasoning at all. Subtracting it isolates the marginal
-   contribution of the reasoning, so the score rewards tokens that *explain the
-   answer*, not tokens that are merely fluent. A token is accepted only if it
-   raises this score by at least ``gain_threshold`` nats; otherwise the path has
-   gone flat (a wrong turn / natural end) and we backtrack or stop. This uses
-   exactly what the attacker has (Q and A) and never touches the <think> tokens.
+   contribution of the reasoning. We emit the prefix that maximises ``delta(c)``,
+   provided that maximum clears ``gain_threshold`` nats over the control (else the
+   reasoning does not explain A and we emit nothing). Crucially we do NOT rank the
+   beam by ``delta(c)`` per token: one reasoning token barely moves P(A) -- the
+   marginal is ~0 and often negative near the root -- so per-token answer ranking
+   abandons the true path in that dip. Priming drives; the answer anchors. This
+   uses exactly what the attacker has (Q and A) and never touches the <think>
+   tokens.
 
 2. ``continuation`` (cheap proposal-style variant). delta = logits_target(Q +
    <think> + prefix) - logits_base(<think> + prefix) isolates the question's
@@ -186,6 +190,7 @@ class Beam:
     seq: Tuple[int, ...] = field(compare=False, default=())
     finished: bool = field(compare=False, default=False)
     dead: bool = field(compare=False, default=False)
+    adelta: float = field(compare=False, default=0.0)  # cumulative delta log P(A)
 
 
 @dataclass
@@ -215,8 +220,8 @@ class DifferentialExtractor:
         method: str = "answer_anchored",
         beam_width: int = 4,
         top_k: int = 8,
-        delta_threshold: float = 1.0,   # continuation: min priming logit delta
-        gain_threshold: float = 0.05,   # answer_anchored: min nat gain per token
+        delta_threshold: float = 1.0,   # both: min priming logit delta to keep exploring
+        gain_threshold: float = 0.05,   # answer_anchored: min cumulative nat gain in log P(A) to emit
         max_tokens: int = 64,
     ):
         assert method in ("answer_anchored", "continuation")
@@ -261,54 +266,67 @@ class DifferentialExtractor:
 
     # -- answer-anchored search -------------------------------------------- #
     def _run_answer_anchored(self):
+        """Priming-driven reconstruction with answer-anchored truncation.
+
+        A single reasoning token barely shifts the likelihood of the whole answer
+        A (and can even *lower* it, since a one-word-then-closed trace is an odd
+        state), so the per-token answer marginal is ~0 and non-monotonic near the
+        root. Ranking the beam by that marginal makes the search abandon the true
+        path in the initial dip. So we **drive the beam with the question-priming
+        differential** ``target - base`` (the side channel proper -- it robustly
+        surfaces the next reasoning token), exactly like ``continuation``, and use
+        the public answer A only as an **anchor**: among the primed candidates we
+        score cumulative ``log P(A | Q, <think> prefix </think>)`` and keep, as
+        the extraction, the prefix that maximises it -- provided that maximum
+        clears ``gain_threshold`` over the empty-reasoning control. If the answer
+        likelihood never meaningfully rises (no channel), we extract nothing.
+
+        ``delta_threshold`` bounds the reasoning (a natural end when the priming
+        signal fades); ``gain_threshold`` is the absolute answer-likelihood gain
+        the winning prefix must clear to be emitted.
+        """
         base_ll = self.oracle.base_answer_loglik()
-        beams = [Beam(neg_score=0.0, seq=(), finished=False)]  # delta_ll = 0 at root
+        beams = [Beam(neg_score=0.0, seq=(), adelta=0.0)]  # neg_score = -cumulative priming
+        best_seq: Tuple[int, ...] = ()
+        best_adelta = 0.0
         signal: List[float] = []
 
         for _ in range(self.max_tokens):
             if all(b.finished for b in beams):
                 break
             candidates: List[Beam] = []
-            step_best_gain = 0.0
+            step_best_gain = float("-inf")
 
             for b in beams:
                 if b.finished:
                     candidates.append(b)
                     continue
-                parent_delta = -b.neg_score
-                proposals = [t for _, t in self._propose(b.seq)
+                # Proposal + search driver: question-priming delta (target-base).
+                proposals = [(d, t) for d, t in self._propose(b.seq)
                              if t != self.oracle.think_close_id]
-                if not proposals:
-                    b.finished = True
+                kept = [(d, t) for d, t in proposals if d >= self.delta_threshold]
+                if not kept:
+                    b.finished = True  # priming faded -> reasoning has ended
                     candidates.append(b)
                     continue
 
-                # One batched teacher-forced forward scores every candidate.
-                child_lls = self.oracle.answer_loglik_batch([b.seq + (t,) for t in proposals])
-                scored = []
-                for t, child_ll in zip(proposals, child_lls):
-                    child_delta = child_ll - base_ll
-                    gain = child_delta - parent_delta
-                    scored.append((gain, child_delta, t))
-                best_gain = max(g for g, _, _ in scored)
-                step_best_gain = max(step_best_gain, best_gain)
+                # Anchor: one batched teacher-forced forward scores log P(A) for
+                # every primed candidate; the answer decides the truncation point.
+                child_lls = self.oracle.answer_loglik_batch([b.seq + (t,) for _, t in kept])
+                parent_prime = -b.neg_score
+                for (d, t), child_ll in zip(kept, child_lls):
+                    adelta = child_ll - base_ll
+                    step_best_gain = max(step_best_gain, adelta - b.adelta)
+                    candidates.append(
+                        Beam(neg_score=-(parent_prime + d), seq=b.seq + (t,), adelta=adelta)
+                    )
+                    if adelta > best_adelta and adelta >= self.gain_threshold:
+                        best_adelta, best_seq = adelta, b.seq + (t,)
 
-                # Backtracking / stopping: if no token meaningfully raises the
-                # answer likelihood, this path is a wrong turn or a natural end.
-                if best_gain < self.gain_threshold:
-                    b.finished = True
-                    candidates.append(b)
-                    continue
+            signal.append(step_best_gain if step_best_gain != float("-inf") else 0.0)
+            beams = heapq.nsmallest(self.beam_width, candidates)  # rank by cumulative priming
 
-                for gain, child_delta, t in scored:
-                    if gain < self.gain_threshold:
-                        continue
-                    candidates.append(Beam(neg_score=-child_delta, seq=b.seq + (t,)))
-
-            signal.append(step_best_gain)
-            beams = heapq.nsmallest(self.beam_width, candidates)
-
-        return beams, signal
+        return [Beam(neg_score=-best_adelta, seq=best_seq)], signal
 
     # -- continuation search (cheap variant) ------------------------------- #
     def _run_continuation(self):

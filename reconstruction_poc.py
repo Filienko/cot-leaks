@@ -56,8 +56,9 @@ def parse_args():
     p.add_argument("--delta-threshold", type=float, default=1.0,
                    help="continuation only: min target-base logit delta to accept a token.")
     p.add_argument("--gain-threshold", type=float, default=0.05,
-                   help="answer_anchored only: min gain (nats) in log P(A) to accept a token. "
-                        "Model/dataset dependent -- raise for precision, lower to extract more.")
+                   help="answer_anchored only: min cumulative gain (nats) in log P(A) over the "
+                        "empty-reasoning control that the emitted prefix must clear. Model/dataset "
+                        "dependent -- raise for precision, lower to extract more.")
     p.add_argument("--max-tokens", type=int, default=64,
                    help="Max CoT tokens to reconstruct via the side channel.")
     p.add_argument("--gt-max-new-tokens", type=int, default=400,

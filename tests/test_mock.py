@@ -94,6 +94,44 @@ def test_answer_anchored_recovers_hidden():
           f"{result.queries_per_token():.1f} q/token")
 
 
+class DipOracle(MockOracle):
+    """Real-model-shaped signal: a single reasoning token barely moves (and can
+    even lower) log P(A); the payoff only accumulates over several tokens.
+
+    ``answer_loglik`` returns the *cumulative* delta as a function of how many
+    hidden tokens are recovered: it dips negative for the first token, then
+    climbs. The old per-token-gain gate gave up at step 1 on exactly this shape
+    (marginal <= 0 -> 0 tokens); the cumulative-gain search must climb out.
+    """
+
+    # cumulative delta log P(A) indexed by recovered-prefix length.
+    CUMULATIVE = [0.0, -0.3, -0.1, 0.2, 0.6, 1.0]
+
+    def answer_loglik_batch(self, prefixes):
+        self.counter.tick(len(prefixes))
+        out = []
+        for p in prefixes:
+            m = min(_match_len(p, self.hidden), len(self.CUMULATIVE) - 1)
+            out.append(self.CUMULATIVE[m])
+        return out
+
+
+def test_answer_anchored_climbs_out_of_dip():
+    hidden = [3, 14, 7, 42, 8]
+    oracle = DipOracle(hidden)
+    extractor = DifferentialExtractor(
+        oracle, method="answer_anchored", beam_width=4, top_k=6,
+        gain_threshold=0.05, max_tokens=20,
+    )
+    result = extractor.run(decode=lambda ids: ",".join(map(str, ids)))
+    # The old gate returned []; the cumulative search recovers the hidden trace
+    # despite the negative first-token marginal.
+    assert result.token_ids == hidden, f"got {result.token_ids}, want {hidden}"
+    assert abs(result.score - 1.0) < 1e-6, f"final delta logP(A)={result.score}"
+    print(f"  climbs out of the negative first-token dip; recovered hidden, "
+          f"delta logP(A)={result.score:.1f}")
+
+
 def test_answer_anchored_stops_on_flat_signal():
     # bonus below threshold -> no token meaningfully explains A -> stop early.
     oracle = MockOracle([1, 2, 3], bonus=0.1)
@@ -146,6 +184,7 @@ def test_query_counter():
 if __name__ == "__main__":
     tests = [
         test_answer_anchored_recovers_hidden,
+        test_answer_anchored_climbs_out_of_dip,
         test_answer_anchored_stops_on_flat_signal,
         test_continuation_recovers_hidden,
         test_metrics_sanity,
